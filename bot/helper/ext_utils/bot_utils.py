@@ -373,10 +373,8 @@ def get_content_type(link: str) -> str:
 ONE, TWO, THREE = range(3)
 
 def refresh(update, context):
-    uname = update.message.from_user.mention_html(update.message.from_user.first_name)
-    user = context.bot.get_chat_member(CHAT_ID, update.message.from_user.id)
     query = update.callback_query
-    query.edit_message_text(text=f"Hey {uname}, Please Wait while I'm Refreshing Your Status...⏳")
+    query.edit_message_text(text="Hey, Please Wait while I'm Refreshing Your Status...⏳")
     sleep(5)
     update_all_messages()
 
