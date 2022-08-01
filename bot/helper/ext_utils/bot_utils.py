@@ -1,24 +1,22 @@
 from re import match as re_match, findall as re_findall
 from threading import Thread, Event
 from time import time
+import psutil
+import shutil
 from math import ceil
 from html import escape
+from psutil import disk_usage, cpu_percent, swap_memory, cpu_count, virtual_memory, net_io_counters, boot_time
 from requests import head as rhead
 from urllib.request import urlopen
-from bot import download_dict, download_dict_lock, STATUS_LIMIT, botStartTime, DOWNLOAD_DIR
-from bot.helper.telegram_helper.bot_commands import BotCommands
-from bot.helper.telegram_helper.button_build import ButtonMaker
-import shutil
-import psutil
-from psutil import virtual_memory, cpu_percent, disk_usage
-from telegram import InlineKeyboardMarkup
-from telegram.error import RetryAfter
-from telegram.ext import CallbackQueryHandler
 from telegram.message import Message
+from telegram import InlineKeyboardMarkup
+from telegram.ext import CallbackQueryHandler
+from telegram.error import RetryAfter
+from bot.helper.telegram_helper.bot_commands import BotCommands
+from bot import bot, download_dict, download_dict_lock, STATUS_LIMIT, botStartTime, DOWNLOAD_DIR, dispatcher, OWNER_ID, status_reply_dict, status_reply_dict_lock, LOGGER
+from bot.helper.telegram_helper.button_build import ButtonMaker
 from telegram.update import Update
 from bot import *
-
-
 
 MAGNET_REGEX = r"magnet:\?xt=urn:btih:[a-zA-Z0-9]*"
 
@@ -29,17 +27,16 @@ PAGE_NO = 1
 
 
 class MirrorStatus:
-    STATUS_UPLOADING = "Uploading..."
-    STATUS_DOWNLOADING = "Downloading..."
-    STATUS_CLONING = "Cloning..."
-    STATUS_WAITING = "Queued..."
-    STATUS_FAILED = "Failed. Cleaning Download..."
-    STATUS_PAUSE = "Paused..."
-    STATUS_ARCHIVING = "Archiving..."
-    STATUS_EXTRACTING = "Extracting..."
-    STATUS_SPLITTING = "Splitting..."
-    STATUS_CHECKING = "CheckingUp..."
-    STATUS_SEEDING = "Seeding..."
+    STATUS_UPLOADING = "Uploading...📤"
+    STATUS_DOWNLOADING = "Downloading...📥"
+    STATUS_CLONING = "Cloning...♻️"
+    STATUS_WAITING = "Queued...💤"
+    STATUS_PAUSE = "Paused...⛔️"
+    STATUS_ARCHIVING = "Archiving...🔐"
+    STATUS_EXTRACTING = "Extracting...📂"
+    STATUS_SPLITTING = "Splitting...✂️"
+    STATUS_CHECKING = "CheckingUp...📝"
+    STATUS_SEEDING = "Seeding...🌧"
 
 SIZE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
 
@@ -76,32 +73,34 @@ def getDownloadByGid(gid):
     with download_dict_lock:
         for dl in list(download_dict.values()):
             status = dl.status()
-            if dl.gid() == gid:
+            if (
+                status
+                not in [
+                    MirrorStatus.STATUS_ARCHIVING,
+                    MirrorStatus.STATUS_EXTRACTING,
+                    MirrorStatus.STATUS_SPLITTING,
+                ]
+                and dl.gid() == gid
+            ):
                 return dl
     return None
 
 def getAllDownload(req_status: str):
     with download_dict_lock:
         for dl in list(download_dict.values()):
-            if dl:
-                status = dl.status()
-                if req_status == 'all':
+            status = dl.status()
+            if status not in [MirrorStatus.STATUS_ARCHIVING, MirrorStatus.STATUS_EXTRACTING, MirrorStatus.STATUS_SPLITTING] and dl:
+                if req_status == 'down' and (status not in [MirrorStatus.STATUS_SEEDING,
+                                                            MirrorStatus.STATUS_UPLOADING,
+                                                            MirrorStatus.STATUS_CLONING]):
                     return dl
-                if req_status == 'down' and status in [MirrorStatus.STATUS_DOWNLOADING,
-                                                         MirrorStatus.STATUS_WAITING,
-                                                         MirrorStatus.STATUS_PAUSE]:
+                elif req_status == 'up' and status == MirrorStatus.STATUS_UPLOADING:
                     return dl
-                if req_status == 'up' and status == MirrorStatus.STATUS_UPLOADING:
+                elif req_status == 'clone' and status == MirrorStatus.STATUS_CLONING:
                     return dl
-                if req_status == 'clone' and status == MirrorStatus.STATUS_CLONING:
+                elif req_status == 'seed' and status == MirrorStatus.STATUS_SEEDING:
                     return dl
-                if req_status == 'seed' and status == MirrorStatus.STATUS_SEEDING:
-                    return dl
-                if req_status == 'split' and status == MirrorStatus.STATUS_SPLITTING:
-                    return dl
-                if req_status == 'extract' and status == MirrorStatus.STATUS_EXTRACTING:
-                    return dl
-                if req_status == 'archive' and status == MirrorStatus.STATUS_ARCHIVING:
+                elif req_status == 'all':
                     return dl
     return None
 
@@ -111,73 +110,12 @@ def get_progress_bar_string(status):
     p = 0 if total == 0 else round(completed * 100 / total)
     p = min(max(p, 0), 100)
     cFull = p // 8
-    p_str = '▰' * cFull
+    p_str = '⬤' * cFull
     max_size = 100 // 8
-    p_str += '▱' * (max_size - cFull)
+    p_str += '○' * (max_size - cFull)
     p_str = f"[{p_str}]"
     return p_str
 
-def auto_delete_message(bot, cmd_message: Message, bot_message: Message):
-    if AUTO_DELETE_MESSAGE_DURATION != -1:
-        sleep(AUTO_DELETE_MESSAGE_DURATION)
-        try:
-            # Skip if None is passed meaning we don't want to delete bot xor cmd message
-            deleteMessage(bot, cmd_message)
-            deleteMessage(bot, bot_message)
-        except AttributeError:
-            pass
-
-def editMessage(text: str, message: Message, reply_markup=None):
-    try:
-        bot.editMessageText(text=text, message_id=message.message_id,
-                              chat_id=message.chat.id,reply_markup=reply_markup,
-                              parse_mode='HTMl', disable_web_page_preview=True)
-    except RetryAfter as r:
-        LOGGER.warning(str(r))
-        sleep(r.retry_after * 1.5)
-        return editMessage(text, message, reply_markup)
-    except Exception as e:
-        LOGGER.error(str(e))
-        return str(e)
-
-def deleteMessage(bot, message: Message):
-    try:
-        bot.deleteMessage(chat_id=message.chat.id,
-                           message_id=message.message_id)
-    except Exception as e:
-        LOGGER.error(str(e))
-
-def delete_all_messages():
-    with status_reply_dict_lock:
-        for data in list(status_reply_dict.values()):
-            try:
-                deleteMessage(bot, data[0])
-                del status_reply_dict[data[0].chat.id]
-            except Exception as e:
-                LOGGER.error(str(e))
-
-def update_all_messages(force=False):
-    with status_reply_dict_lock:
-        if not force and (not status_reply_dict or not Interval or time() - list(status_reply_dict.values())[0][1] < 3):
-            return
-        for chat_id in status_reply_dict:
-            status_reply_dict[chat_id][1] = time()
-
-    msg, buttons = get_readable_message()
-    if msg is None:
-        return
-    with status_reply_dict_lock:
-        for chat_id in status_reply_dict:
-            if status_reply_dict[chat_id] and msg != status_reply_dict[chat_id][0].text:
-                if buttons == "":
-                    rmsg = editMessage(msg, status_reply_dict[chat_id][0])
-                else:
-                    rmsg = editMessage(msg, status_reply_dict[chat_id][0], buttons)
-                if rmsg == "Message to edit not found":
-                    del status_reply_dict[chat_id]
-                    return
-                status_reply_dict[chat_id][0].text = msg
-                status_reply_dict[chat_id][1] = time()
 def get_readable_message():
     with download_dict_lock:
         msg = ""
@@ -230,6 +168,7 @@ def get_readable_message():
                 msg += f" | <b>Time: </b>{get_readable_time(download.torrent_info().seeding_time)}"
             else:
                 msg += f"\n<b>Size: </b>{download.size()}"
+                msg += f"\n<b>Engine :</b> {download.eng()}"
             msg += f"\n<b>To Cancel: </b><code>/{BotCommands.CancelMirror} {download.gid()}</code>"
             msg += "\n"
             if STATUS_LIMIT is not None and index == STATUS_LIMIT:
@@ -273,6 +212,7 @@ def get_readable_message():
 
             return msg + bmsg, button
         return msg + bmsg, sbutton
+
 
 def turn(data):
     try:
@@ -371,32 +311,74 @@ def get_content_type(link: str) -> str:
     return content_type
 
 ONE, TWO, THREE = range(3)
+def auto_delete_message(bot, cmd_message: Message, bot_message: Message):
+    if AUTO_DELETE_MESSAGE_DURATION != -1:
+        sleep(AUTO_DELETE_MESSAGE_DURATION)
+        try:
+            # Skip if None is passed meaning we don't want to delete bot xor cmd message
+            deleteMessage(bot, cmd_message)
+            deleteMessage(bot, bot_message)
+        except AttributeError:
+            pass
 
+def editMessage(text: str, message: Message, reply_markup=None):
+    try:
+        bot.editMessageText(text=text, message_id=message.message_id,
+                              chat_id=message.chat.id,reply_markup=reply_markup,
+                              parse_mode='HTMl', disable_web_page_preview=True)
+    except RetryAfter as r:
+        LOGGER.warning(str(r))
+        sleep(r.retry_after * 1.5)
+        return editMessage(text, message, reply_markup)
+    except Exception as e:
+        LOGGER.error(str(e))
+        return str(e)
+    
+def deleteMessage(bot, message: Message):
+    try:
+        bot.deleteMessage(chat_id=message.chat.id,
+                           message_id=message.message_id)
+    except Exception as e:
+        LOGGER.error(str(e))
+
+def delete_all_messages():
+    with status_reply_dict_lock:
+        for message in list(status_reply_dict.values()):
+            try:
+                deleteMessage(bot, message)
+                del status_reply_dict[message.chat.id]
+            except Exception as e:
+                LOGGER.error(str(e))
+                
+def update_all_messages(force=False):
+    with status_reply_dict_lock:
+        if not force and (not status_reply_dict or not Interval or time() - list(status_reply_dict.values())[0][1] < 3):
+            return
+        for chat_id in status_reply_dict:
+            status_reply_dict[chat_id][1] = time()                
 def refresh(update, context):
     query = update.callback_query
-    query.edit_message_text(text="Hey, Please Wait while I'm Refreshing Your Status...⏳")
+    query.edit_message_text(text="Please wait while I'm Refreshing Your Status...⏳")
     sleep(5)
     update_all_messages()
-
+    
 def close(update, context):
     chat_id = update.effective_chat.id
     user_id = update.callback_query.from_user.id
     bot = context.bot
     query = update.callback_query
-    admins = bot.get_chat_member(chat_id, user_id).status in [
+    is_admin = bot.get_chat_member(chat_id, user_id).status in [
         "creator",
         "administrator",
     ] or user_id in [OWNER_ID]
-    if admins:
+    if is_admin:
         delete_all_messages()
     else:
-        query.answer(text="Sorry, only Admins can close !", show_alert=True)
-
+        query.answer(text="Never Gonna Give You UP! ", show_alert=True)
 def pop_up_stats(update, context):
     query = update.callback_query
     stats = bot_sys_stats()
     query.answer(text=stats, show_alert=True)
-
 def bot_sys_stats():
     currentTime = get_readable_time(time() - botStartTime)
     cpu = psutil.cpu_percent()
@@ -415,11 +397,9 @@ T-DN: {recv} | T-UP: {sent}
 CPU: {cpu}% | RAM: {mem}%
 Disk: {total} | Free: {free}
 Used: {used} [{disk}%]
-Hope You Like the Service
+Keep Spamming ! & Keep Supporting !
 """
     return stats
-
 dispatcher.add_handler(CallbackQueryHandler(refresh, pattern="^" + str(ONE) + "$"))
 dispatcher.add_handler(CallbackQueryHandler(close, pattern="^" + str(TWO) + "$"))
 dispatcher.add_handler(CallbackQueryHandler(pop_up_stats, pattern="^" + str(THREE) + "$"))
-
